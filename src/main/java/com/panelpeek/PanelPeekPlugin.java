@@ -1,11 +1,34 @@
+/*
+ * Copyright (c) 2025, zergberg
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
 package com.panelpeek;
 
+import com.google.inject.Injector;
+import com.google.inject.Key;
 import com.google.inject.Provides;
 import java.awt.Rectangle;
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -25,10 +48,10 @@ import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.plugins.PluginManager;
-import net.runelite.client.ui.ClientToolbar;
-import net.runelite.client.ui.NavigationButton;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.events.OverlayMenuClicked;
+import net.runelite.client.ui.overlay.OverlayMenuEntry;
 import net.runelite.client.ui.overlay.infobox.InfoBox;
 import net.runelite.client.ui.overlay.infobox.InfoBoxManager;
 
@@ -61,17 +84,7 @@ public class PanelPeekPlugin extends Plugin
 	@Inject
 	private PanelPeekConfig config;
 
-	@Inject
-	private ClientToolbar clientToolbar;
-
-	private Field overlaysField;
-	private Field infoBoxPluginField;
 	private EventBus.Subscriber menuOpenedSubscriber;
-
-	// Reflection handles for side-panel mode
-	private Field configPluginNavButtonField;
-	private Field configPluginTopLevelConfigPanelField;
-	private Method openConfigurationPanelMethod;
 
 	@Provides
 	PanelPeekConfig provideConfig(ConfigManager configManager)
@@ -82,49 +95,6 @@ public class PanelPeekPlugin extends Plugin
 	@Override
 	protected void startUp()
 	{
-		try
-		{
-			overlaysField = OverlayManager.class.getDeclaredField("overlays");
-			overlaysField.setAccessible(true);
-			log.info("[PanelPeek] overlays field found OK");
-		}
-		catch (NoSuchFieldException e)
-		{
-			log.error("[PanelPeek] Could not find overlays field on OverlayManager", e);
-		}
-
-		try
-		{
-			infoBoxPluginField = InfoBox.class.getDeclaredField("plugin");
-			infoBoxPluginField.setAccessible(true);
-		}
-		catch (NoSuchFieldException e)
-		{
-			log.error("[PanelPeek] Could not find plugin field on InfoBox", e);
-		}
-
-		// Cache reflection handles for side-panel mode (ConfigPlugin internals)
-		try
-		{
-			Class<?> configPluginClass = Class.forName("net.runelite.client.plugins.config.ConfigPlugin");
-
-			configPluginNavButtonField = configPluginClass.getDeclaredField("navButton");
-			configPluginNavButtonField.setAccessible(true);
-
-			configPluginTopLevelConfigPanelField = configPluginClass.getDeclaredField("topLevelConfigPanel");
-			configPluginTopLevelConfigPanelField.setAccessible(true);
-
-			Class<?> topLevelConfigPanelClass = Class.forName("net.runelite.client.plugins.config.TopLevelConfigPanel");
-			openConfigurationPanelMethod = topLevelConfigPanelClass.getDeclaredMethod("openConfigurationPanel", String.class);
-			openConfigurationPanelMethod.setAccessible(true);
-
-			log.info("[PanelPeek] Side-panel reflection handles cached OK");
-		}
-		catch (Exception e)
-		{
-			log.warn("[PanelPeek] Could not set up side-panel reflection; will fall back to dialog mode", e);
-		}
-
 		menuOpenedSubscriber = eventBus.register(MenuOpened.class, this::onMenuOpened, 0f);
 		log.info("[PanelPeek] Started OK");
 	}
@@ -147,70 +117,56 @@ public class PanelPeekPlugin extends Plugin
 		}
 
 		Point mouse = client.getMouseCanvasPosition();
-		List<Overlay> overlays = getAllOverlays();
-		log.debug("[PanelPeek] MenuOpened with ctrl held. Mouse=({},{}) overlays={}", mouse.getX(), mouse.getY(), overlays.size());
+		int mouseX = mouse.getX();
+		int mouseY = mouse.getY();
 
-		// Iterate in reverse so we hit the topmost (last-rendered) overlay first
-		for (int i = overlays.size() - 1; i >= 0; i--)
+		Overlay overlay = findOverlayAtMouse(mouseX, mouseY);
+		if (overlay == null)
 		{
-			Overlay overlay = overlays.get(i);
-			Rectangle bounds = overlay.getBounds();
-
-			if (bounds == null || bounds.isEmpty())
-			{
-				continue;
-			}
-
-			if (!bounds.contains(mouse.getX(), mouse.getY()))
-			{
-				continue;
-			}
-
-			// InfoBoxOverlay is a shared container — multiple plugins' info boxes live here
-			if (overlay.getClass().getSimpleName().equals("InfoBoxOverlay"))
-			{
-				addInfoBoxMenuEntries();
-				break;
-			}
-
-			Plugin ownerPlugin = overlay.getPlugin();
-			if (ownerPlugin == null)
-			{
-				ownerPlugin = findPluginByPackage(overlay);
-			}
-			if (ownerPlugin == null)
-			{
-				log.debug("[PanelPeek] Overlay {} has no plugin owner (pkg={}), skipping",
-					overlay.getClass().getSimpleName(), overlay.getClass().getPackage().getName());
-				continue;
-			}
-
-			addMenuEntryForPlugin(ownerPlugin);
-			break;
+			return;
 		}
+
+		log.debug("[PanelPeek] MenuOpened with ctrl held. Mouse=({},{}) hit={}",
+			mouseX, mouseY, overlay.getClass().getSimpleName());
+
+		// InfoBoxOverlay is a shared container — multiple plugins' info boxes live here
+		if (overlay.getClass().getSimpleName().equals("InfoBoxOverlay"))
+		{
+			addInfoBoxMenuEntries(overlay);
+			return;
+		}
+
+		Plugin ownerPlugin = overlay.getPlugin();
+		if (ownerPlugin == null)
+		{
+			ownerPlugin = findPluginByPackage(overlay);
+		}
+		if (ownerPlugin == null)
+		{
+			log.debug("[PanelPeek] Overlay {} has no plugin owner (pkg={}), skipping",
+				overlay.getClass().getSimpleName(), overlay.getClass().getPackage().getName());
+			return;
+		}
+
+		addMenuEntryForPlugin(ownerPlugin, overlay);
 	}
 
-	@SuppressWarnings("unchecked")
-	private List<Overlay> getAllOverlays()
+	private Overlay findOverlayAtMouse(int mouseX, int mouseY)
 	{
-		if (overlaysField == null)
+		List<Overlay> matched = new ArrayList<>();
+		overlayManager.anyMatch(overlay ->
 		{
-			return Collections.emptyList();
-		}
-
-		try
-		{
-			List<Overlay> overlays = (List<Overlay>) overlaysField.get(overlayManager);
-			return overlays != null ? new ArrayList<>(overlays) : Collections.emptyList();
-		}
-		catch (IllegalAccessException e)
-		{
-			log.warn("Could not access overlay list", e);
-			return Collections.emptyList();
-		}
+			Rectangle bounds = overlay.getBounds();
+			if (bounds != null && !bounds.isEmpty() && bounds.contains(mouseX, mouseY))
+			{
+				matched.add(overlay);
+			}
+			return false; // iterate all
+		});
+		return matched.isEmpty() ? null : matched.get(matched.size() - 1);
 	}
 
-	private void addMenuEntryForPlugin(Plugin ownerPlugin)
+	private void addMenuEntryForPlugin(Plugin ownerPlugin, Overlay overlay)
 	{
 		Class<? extends Config> configClass = findConfigClass(ownerPlugin);
 		if (configClass == null)
@@ -222,37 +178,48 @@ public class PanelPeekPlugin extends Plugin
 		PluginDescriptor desc = ownerPlugin.getClass().getAnnotation(PluginDescriptor.class);
 		String pluginName = desc != null ? desc.name() : ownerPlugin.getClass().getSimpleName();
 		final Class<? extends Config> cfgClass = configClass;
+		final Plugin plugin = ownerPlugin;
 
 		client.createMenuEntry(-1)
 			.setOption("Open Settings")
 			.setTarget("<col=00ff00>" + pluginName + "</col>")
 			.setType(MenuAction.RUNELITE)
-			.onClick(e -> openConfig(pluginName, cfgClass));
+			.onClick(e -> openConfig(pluginName, cfgClass, overlay, plugin));
 	}
 
-	private void addInfoBoxMenuEntries()
+	private void addInfoBoxMenuEntries(Overlay infoBoxOverlay)
 	{
-		if (infoBoxPluginField == null)
-		{
-			return;
-		}
-
 		Set<Plugin> seen = new LinkedHashSet<>();
 		for (InfoBox box : infoBoxManager.getInfoBoxes())
 		{
-			try
+			String name = box.getName();
+			if (name == null)
 			{
-				Plugin p = (Plugin) infoBoxPluginField.get(box);
-				if (p != null && seen.add(p))
-				{
-					addMenuEntryForPlugin(p);
-				}
+				continue;
 			}
-			catch (IllegalAccessException e)
+
+			// InfoBox.getName() returns "PluginSimpleName_InfoBoxSimpleName"
+			int sep = name.indexOf('_');
+			String pluginSimpleName = sep > 0 ? name.substring(0, sep) : name;
+
+			Plugin plugin = findPluginBySimpleName(pluginSimpleName);
+			if (plugin != null && seen.add(plugin))
 			{
-				// skip
+				addMenuEntryForPlugin(plugin, infoBoxOverlay);
 			}
 		}
+	}
+
+	private Plugin findPluginBySimpleName(String simpleName)
+	{
+		for (Plugin p : pluginManager.getPlugins())
+		{
+			if (p.getClass().getSimpleName().equals(simpleName))
+			{
+				return p;
+			}
+		}
+		return null;
 	}
 
 	private Plugin findPluginByPackage(Overlay overlay)
@@ -273,35 +240,21 @@ public class PanelPeekPlugin extends Plugin
 	{
 		try
 		{
-			for (Method method : plugin.getClass().getDeclaredMethods())
+			Injector injector = plugin.getInjector();
+			if (injector == null)
 			{
-				if (!method.isAnnotationPresent(Provides.class))
-				{
-					continue;
-				}
-
-				Class<?> returnType = method.getReturnType();
-				if (returnType.isInterface()
-					&& Config.class.isAssignableFrom(returnType)
-					&& returnType.isAnnotationPresent(ConfigGroup.class))
-				{
-					return (Class<? extends Config>) returnType;
-				}
+				return null;
 			}
 
-			for (Method method : plugin.getClass().getMethods())
+			for (Key<?> key : injector.getBindings().keySet())
 			{
-				if (!method.isAnnotationPresent(Provides.class))
+				Class<?> type = key.getTypeLiteral().getRawType();
+				if (type.isInterface()
+					&& type != Config.class
+					&& Config.class.isAssignableFrom(type)
+					&& type.isAnnotationPresent(ConfigGroup.class))
 				{
-					continue;
-				}
-
-				Class<?> returnType = method.getReturnType();
-				if (returnType.isInterface()
-					&& Config.class.isAssignableFrom(returnType)
-					&& returnType.isAnnotationPresent(ConfigGroup.class))
-				{
-					return (Class<? extends Config>) returnType;
+					return (Class<? extends Config>) type;
 				}
 			}
 		}
@@ -313,74 +266,44 @@ public class PanelPeekPlugin extends Plugin
 		return null;
 	}
 
-	private void openConfig(String pluginName, Class<? extends Config> configClass)
+	private void openConfig(String pluginName, Class<? extends Config> cfgClass, Overlay overlay, Plugin plugin)
 	{
-		if (config.openMode() == OpenMode.SIDE_PANEL && openInSidePanel(pluginName))
+		if (config.openMode() == OpenMode.SIDE_PANEL && openInSidePanel(pluginName, overlay, plugin))
 		{
 			return;
 		}
 
-		openInDialog(pluginName, configClass);
+		openInDialog(pluginName, cfgClass);
 	}
 
-	private boolean openInSidePanel(String pluginName)
+	private boolean openInSidePanel(String pluginName, Overlay overlay, Plugin plugin)
 	{
-		if (configPluginNavButtonField == null || configPluginTopLevelConfigPanelField == null || openConfigurationPanelMethod == null)
+		// Find an overlay owned by this plugin to use with OverlayMenuClicked
+		Overlay targetOverlay = overlay;
+		if (targetOverlay == null || !plugin.equals(targetOverlay.getPlugin()))
 		{
-			log.debug("[PanelPeek] Side-panel reflection not available, falling back to dialog");
-			return false;
-		}
-
-		try
-		{
-			Plugin configPlugin = null;
-			for (Plugin p : pluginManager.getPlugins())
+			// InfoBox case or no direct match — find any overlay owned by this plugin
+			List<Overlay> pluginOverlays = new ArrayList<>();
+			overlayManager.anyMatch(o ->
 			{
-				if (p.getClass().getName().equals("net.runelite.client.plugins.config.ConfigPlugin"))
+				if (plugin.equals(o.getPlugin()))
 				{
-					configPlugin = p;
-					break;
+					pluginOverlays.add(o);
 				}
-			}
-
-			if (configPlugin == null)
-			{
-				log.warn("[PanelPeek] ConfigPlugin not found");
 				return false;
-			}
-
-			Object navButton = configPluginNavButtonField.get(configPlugin);
-			Object topLevelConfigPanel = configPluginTopLevelConfigPanelField.get(configPlugin);
-
-			if (navButton == null || topLevelConfigPanel == null)
-			{
-				log.warn("[PanelPeek] ConfigPlugin navButton or topLevelConfigPanel is null");
-				return false;
-			}
-
-			final NavigationButton nav = (NavigationButton) navButton;
-			final Object panel = topLevelConfigPanel;
-
-			SwingUtilities.invokeLater(() ->
-			{
-				try
-				{
-					clientToolbar.openPanel(nav);
-					openConfigurationPanelMethod.invoke(panel, pluginName);
-				}
-				catch (Exception e)
-				{
-					log.error("[PanelPeek] Failed to open side panel for {}", pluginName, e);
-				}
 			});
 
-			return true;
+			if (pluginOverlays.isEmpty())
+			{
+				log.debug("[PanelPeek] No overlay found for plugin {}, falling back to dialog", pluginName);
+				return false;
+			}
+			targetOverlay = pluginOverlays.get(0);
 		}
-		catch (Exception e)
-		{
-			log.error("[PanelPeek] Side-panel reflection failed for {}", pluginName, e);
-			return false;
-		}
+
+		OverlayMenuEntry entry = new OverlayMenuEntry(MenuAction.RUNELITE_OVERLAY_CONFIG, "Configure", pluginName);
+		eventBus.post(new OverlayMenuClicked(entry, targetOverlay));
+		return true;
 	}
 
 	private void openInDialog(String pluginName, Class<? extends Config> configClass)
